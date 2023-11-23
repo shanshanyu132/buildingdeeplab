@@ -1,163 +1,124 @@
 import os
-import sys
-import tarfile
-import collections
-import torch.utils.data as data
-import shutil
+import torch
+import torchvision
+from d2l import torch as d2l
 import numpy as np
 
-from PIL import Image
-from torchvision.datasets.utils import download_url, check_integrity
 
-DATASET_YEAR_DICT = {
-    '2012': {
-        'url': 'http://host.robots.ox.ac.uk/pascal/VOC/voc2012/VOCtrainval_11-May-2012.tar',
-        'filename': 'VOCtrainval_11-May-2012.tar',
-        'md5': '6cd6e144f989b92b3379bac3b3de84fd',
-        'base_dir': 'VOCdevkit/VOC2012'
-    },
-    '2011': {
-        'url': 'http://host.robots.ox.ac.uk/pascal/VOC/voc2011/VOCtrainval_25-May-2011.tar',
-        'filename': 'VOCtrainval_25-May-2011.tar',
-        'md5': '6c3384ef61512963050cb5d687e5bf1e',
-        'base_dir': 'TrainVal/VOCdevkit/VOC2011'
-    },
-    '2010': {
-        'url': 'http://host.robots.ox.ac.uk/pascal/VOC/voc2010/VOCtrainval_03-May-2010.tar',
-        'filename': 'VOCtrainval_03-May-2010.tar',
-        'md5': 'da459979d0c395079b5c75ee67908abb',
-        'base_dir': 'VOCdevkit/VOC2010'
-    },
-    '2009': {
-        'url': 'http://host.robots.ox.ac.uk/pascal/VOC/voc2009/VOCtrainval_11-May-2009.tar',
-        'filename': 'VOCtrainval_11-May-2009.tar',
-        'md5': '59065e4b188729180974ef6572f6a212',
-        'base_dir': 'VOCdevkit/VOC2009'
-    },
-    '2008': {
-        'url': 'http://host.robots.ox.ac.uk/pascal/VOC/voc2008/VOCtrainval_14-Jul-2008.tar',
-        'filename': 'VOCtrainval_11-May-2012.tar',
-        'md5': '2629fa636546599198acfcfbfcf1904a',
-        'base_dir': 'VOCdevkit/VOC2008'
-    },
-    '2007': {
-        'url': 'http://host.robots.ox.ac.uk/pascal/VOC/voc2007/VOCtrainval_06-Nov-2007.tar',
-        'filename': 'VOCtrainval_06-Nov-2007.tar',
-        'md5': 'c52e279531787c972589f7e41ab4ae64',
-        'base_dir': 'VOCdevkit/VOC2007'
-    }
-}
+def read_postdam_images(voc_dir, is_train=True):
+    """读取所有postdam图像并标注"""
+    txt_fname = os.path.join(voc_dir, 'seg_train.txt' if is_train else 'seg_test.txt')
+    # ImageReadMode: 读取模式,将JPEG或PNG图像读入三维RGB张量uint8(0,255)
+    mode = torchvision.io.image.ImageReadMode.RGB
+    with open(txt_fname, 'r') as f:
+        images = f.read().split()
+    features, labels = [], []
+    sum = 0
+    for i, fname in enumerate(images):
+        # features.append(torchvision.io.read_image(os.path.join(
+        #     voc_dir, 'data', 'postdam', 'train' if is_train else 'test', 'img', f'{fname}')))
+        tran = torchvision.io.read_image(os.path.join(voc_dir, 'train' if is_train else 'test', 'label_vis', f'{fname}'), mode)
+        # 过滤标签，过滤为建筑物和背景
+        a = np.where((tran[0]*1+tran[1]*2+tran[2]*10)==2550, 1, 0 )
+
+        a0 = a * 0
+        a1 = np.array([a0, a0, a])
+        tran1 = tran * a1
+        if (a.sum()>=256*256*0.1) & (a.sum()<=256*256*0.8):
+            features.append(torchvision.io.read_image(os.path.join(voc_dir, 'train' if is_train else 'test', 'img', f'{fname}')))
+            labels.append(tran)
+    return features, labels
+
+#我们列举RGB颜色值和类名
+#方便地查找标签中每个像素的类索引
+VOC_COLORMAP = [[0, 0, 255], [0, 0, 0]]
+VOC_CLASSES = ['Building','background']
+
+#voc_colormap2label从RGB值到类别的索引
+#voc_label_indices将RGB值映射到数据集中的类别索引
+def voc_colormap2label():
+    """构建从RGB到VOC类别索引的映射"""
+    colormap2label = torch.zeros(256 ** 3, dtype=torch.long)
+    for i, colormap in enumerate(VOC_COLORMAP):
+        #构造256进制
+        #很妙的构造，256进制转换为10进制
+        #(255*256 + 255)*256 +255 + 1== 256**3
+        colormap2label[(colormap[0] * 256 + colormap[1]) * 256 + colormap[2]] = i
+    return colormap2label
+
+def voc_label_indices(colormap, colormap2label):
+    """将VOC标签中的RGB值映射到它们的类别索引"""
+    #把RGB转换成类别索引，输出（1*256*256），每个像素为【0，21】
+    colormap = colormap.permute(1, 2, 0).numpy().astype('int32')
+    idx = ((colormap[:, :, 0] * 256 + colormap[:, :, 1]) * 256
+           + colormap[:, :, 2])
+    return colormap2label[idx]
+
+def voc_rand_crop(feature, label, height, width, is_train):
+    """随机裁剪特征和标签图像"""
+    #允许输入高宽进行裁剪返回其框（(i, j, h, w)）
+    if is_train:
+        rect = torchvision.transforms.RandomCrop.get_params(feature, (height, width))
+        feature = torchvision.transforms.functional.crop(feature, *rect)
+        label = torchvision.transforms.functional.crop(label, *rect)
+    else:
+        return feature, label
+    return feature, label
 
 
-def voc_cmap(N=256, normalized=False):
-    def bitget(byteval, idx):
-        return ((byteval & (1 << idx)) != 0)
+# 自定义语义分割数据集类，继承高级API提供的Dataset类
+class VOCSegDataset(torch.utils.data.Dataset):
+    """一个用于加载VOC数据集的自定义数据集"""
 
-    dtype = 'float32' if normalized else 'uint8'
-    cmap = np.zeros((N, 3), dtype=dtype)
-    for i in range(N):
-        r = g = b = 0
-        c = i
-        for j in range(8):
-            r = r | (bitget(c, 0) << 7-j)
-            g = g | (bitget(c, 1) << 7-j)
-            b = b | (bitget(c, 2) << 7-j)
-            c = c >> 3
+    # crop_size给定模型训练时小批量图片里的高宽
+    def __init__(self, is_train, crop_size, voc_dir):
+        # ImageNet的标准化
+        self.is_train = is_train
+        self.transform = torchvision.transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        self.crop_size = crop_size
+        features, labels = read_postdam_images(voc_dir, self.is_train)
+        self.features = [self.normalize_image(feature)
+                         for feature in self.filter(features)]
+        self.labels = self.filter(labels)
+        self.colormap2label = voc_colormap2label()
+        print('read ' + str(len(self.features)) + ' examples')
 
-        cmap[i] = np.array([r, g, b])
+    def normalize_image(self, img):
+        return self.transform(img.float() / 255)
 
-    cmap = cmap/255 if normalized else cmap
-    return cmap
+    def filter(self, imgs):
+        # 当图片小于crop_size,直接删除
+        return [img for img in imgs if (img.shape[1] >= self.crop_size[0] and
+                                        img.shape[2] >= self.crop_size[1])]
 
-class VOCSegmentation(data.Dataset):
-    """`Pascal VOC <http://host.robots.ox.ac.uk/pascal/VOC/>`_ Segmentation Dataset.
-    Args:
-        root (string): Root directory of the VOC Dataset.
-        year (string, optional): The dataset year, supports years 2007 to 2012.
-        image_set (string, optional): Select the image_set to use, ``train``, ``trainval`` or ``val``
-        download (bool, optional): If true, downloads the dataset from the internet and
-            puts it in root directory. If dataset is already downloaded, it is not
-            downloaded again.
-        transform (callable, optional): A function/transform that  takes in an PIL image
-            and returns a transformed version. E.g, ``transforms.RandomCrop``
-    """
-    cmap = voc_cmap()
-    def __init__(self,
-                 root,
-                 year='2012',
-                 image_set='train',
-                 download=False,
-                 transform=None):
-
-        is_aug=False
-        if year=='2012_aug':
-            is_aug = True
-            year = '2012'
-        
-        self.root = os.path.expanduser(root)
-        self.year = year
-        self.url = DATASET_YEAR_DICT[year]['url']
-        self.filename = DATASET_YEAR_DICT[year]['filename']
-        self.md5 = DATASET_YEAR_DICT[year]['md5']
-        self.transform = transform
-        
-        self.image_set = image_set
-        base_dir = DATASET_YEAR_DICT[year]['base_dir']
-        voc_root = os.path.join(self.root, base_dir)
-        image_dir = os.path.join(voc_root, 'JPEGImages')
-
-        if download:
-            download_extract(self.url, self.root, self.filename, self.md5)
-
-        if not os.path.isdir(voc_root):
-            raise RuntimeError('Dataset not found or corrupted.' +
-                               ' You can use download=True to download it')
-        
-        if is_aug and image_set=='train':
-            mask_dir = os.path.join(voc_root, 'SegmentationClassAug')
-            assert os.path.exists(mask_dir), "SegmentationClassAug not found, please refer to README.md and prepare it manually"
-            split_f = os.path.join( self.root, 'train_aug.txt')#'./datasets/data/train_aug.txt'
-        else:
-            mask_dir = os.path.join(voc_root, 'SegmentationClass')
-            splits_dir = os.path.join(voc_root, 'ImageSets/Segmentation')
-            split_f = os.path.join(splits_dir, image_set.rstrip('\n') + '.txt')
-
-        if not os.path.exists(split_f):
-            raise ValueError(
-                'Wrong image_set entered! Please use image_set="train" '
-                'or image_set="trainval" or image_set="val"')
-
-        with open(os.path.join(split_f), "r") as f:
-            file_names = [x.strip() for x in f.readlines()]
-        
-        self.images = [os.path.join(image_dir, x + ".jpg") for x in file_names]
-        self.masks = [os.path.join(mask_dir, x + ".png") for x in file_names]
-        assert (len(self.images) == len(self.masks))
-
-    def __getitem__(self, index):
-        """
-        Args:
-            index (int): Index
-        Returns:
-            tuple: (image, target) where target is the image segmentation.
-        """
-        img = Image.open(self.images[index]).convert('RGB')
-        target = Image.open(self.masks[index])
-        if self.transform is not None:
-            img, target = self.transform(img, target)
-
-        return img, target
-
+    def __getitem__(self, idx):
+        # 通过实现__getitem__函数，我们可以任意访问数据集中索引为idx的输入图像
+        # 及其每个像素的类别索引
+        # 使用了数据增强
+        feature, label = voc_rand_crop(self.features[idx], self.labels[idx],
+                                       *self.crop_size, self.is_train)
+        # feature, label = self.features[idx], self.labels[idx]
+        # label返回一张是【0，21】的像素图，通道为1
+        return (feature, voc_label_indices(label, self.colormap2label))
 
     def __len__(self):
-        return len(self.images)
+        return len(self.features)
 
-    @classmethod
-    def decode_target(cls, mask):
-        """decode semantic mask to RGB image"""
-        return cls.cmap[mask]
+def load_data_voc(batch_size, val_batch_size, crop_size):
+    """加载VOC语义分割数据集"""
+    voc_dir = r"E:\buildingdeeplab\dataset\postdam"
+    num_workers = d2l.get_dataloader_workers()
+    train_iter = torch.utils.data.DataLoader(
+        VOCSegDataset(True, crop_size, voc_dir), batch_size,
+        shuffle=True, drop_last=True, num_workers=num_workers)
+    test_iter = torch.utils.data.DataLoader(
+        VOCSegDataset(False, crop_size, voc_dir), val_batch_size,
+        drop_last=True, num_workers=num_workers)
+    return train_iter, test_iter
 
-def download_extract(url, root, filename, md5):
-    download_url(url, root, filename, md5)
-    with tarfile.open(os.path.join(root, filename), "r") as tar:
-        tar.extractall(path=root)
+def label2image(pred, device):
+    #pred值为类别RGB的index
+    colormap = torch.tensor(VOC_COLORMAP, device="cuda:0")
+    X = pred.long()
+    return colormap[X, :]

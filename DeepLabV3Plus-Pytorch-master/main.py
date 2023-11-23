@@ -7,9 +7,10 @@ import argparse
 import numpy as np
 
 from torch.utils import data
-from datasets import VOCSegmentation, Cityscapes
+from datasets import load_data_voc, label2image
 from utils import ext_transforms as et
 from metrics import StreamSegMetrics
+from torch.nn import functional as F
 
 import torch
 import torch.nn as nn
@@ -24,11 +25,11 @@ def get_argparser():
     parser = argparse.ArgumentParser()
 
     # Datset Options
-    parser.add_argument("--data_root", type=str, default='./datasets/data',
-                        help="path to Dataset")
+    # parser.add_argument("--data_root", type=str, default='./datasets/data',
+    #                     help="path to Dataset")
     parser.add_argument("--dataset", type=str, default='voc',
-                        choices=['voc', 'cityscapes'], help='Name of dataset')
-    parser.add_argument("--num_classes", type=int, default=None,
+                         help='Name of dataset')
+    parser.add_argument("--num_classes", type=int, default=2,
                         help="num classes (default: None)")
 
     # Deeplab Options
@@ -46,7 +47,7 @@ def get_argparser():
     parser.add_argument("--test_only", action='store_true', default=False)
     parser.add_argument("--save_val_results", action='store_true', default=False,
                         help="save segmentation results to \"./results\"")
-    parser.add_argument("--total_itrs", type=int, default=30e3,
+    parser.add_argument("--total_itrs", type=int, default=10e3,
                         help="epoch number (default: 30k)")
     parser.add_argument("--lr", type=float, default=0.01,
                         help="learning rate (default: 0.01)")
@@ -55,11 +56,11 @@ def get_argparser():
     parser.add_argument("--step_size", type=int, default=10000)
     parser.add_argument("--crop_val", action='store_true', default=False,
                         help='crop validation (default: False)')
-    parser.add_argument("--batch_size", type=int, default=16,
+    parser.add_argument("--batch_size", type=int, default=128,
                         help='batch size (default: 16)')
-    parser.add_argument("--val_batch_size", type=int, default=4,
+    parser.add_argument("--val_batch_size", type=int, default=64,
                         help='batch size for validation (default: 4)')
-    parser.add_argument("--crop_size", type=int, default=513)
+    parser.add_argument("--crop_size", type=int, default=(150, 200))
 
     parser.add_argument("--ckpt", default=None, type=str,
                         help="restore from checkpoint")
@@ -87,7 +88,7 @@ def get_argparser():
     # Visdom options
     parser.add_argument("--enable_vis", action='store_true', default=False,
                         help="use visdom for visualization")
-    parser.add_argument("--vis_port", type=str, default='13570',
+    parser.add_argument("--vis_port", type=str, default='18097',
                         help='port for visdom')
     parser.add_argument("--vis_env", type=str, default='main',
                         help='env for visdom')
@@ -96,89 +97,59 @@ def get_argparser():
     return parser
 
 
-def get_dataset(opts):
-    """ Dataset And Augmentation
-    """
-    if opts.dataset == 'voc':
-        train_transform = et.ExtCompose([
-            # et.ExtResize(size=opts.crop_size),
-            et.ExtRandomScale((0.5, 2.0)),
-            et.ExtRandomCrop(size=(opts.crop_size, opts.crop_size), pad_if_needed=True),
-            et.ExtRandomHorizontalFlip(),
-            et.ExtToTensor(),
-            et.ExtNormalize(mean=[0.485, 0.456, 0.406],
-                            std=[0.229, 0.224, 0.225]),
-        ])
-        if opts.crop_val:
-            val_transform = et.ExtCompose([
-                et.ExtResize(opts.crop_size),
-                et.ExtCenterCrop(opts.crop_size),
-                et.ExtToTensor(),
-                et.ExtNormalize(mean=[0.485, 0.456, 0.406],
-                                std=[0.229, 0.224, 0.225]),
-            ])
-        else:
-            val_transform = et.ExtCompose([
-                et.ExtToTensor(),
-                et.ExtNormalize(mean=[0.485, 0.456, 0.406],
-                                std=[0.229, 0.224, 0.225]),
-            ])
-        train_dst = VOCSegmentation(root=opts.data_root, year=opts.year,
-                                    image_set='train', download=opts.download, transform=train_transform)
-        val_dst = VOCSegmentation(root=opts.data_root, year=opts.year,
-                                  image_set='val', download=False, transform=val_transform)
-
-    if opts.dataset == 'cityscapes':
-        train_transform = et.ExtCompose([
-            # et.ExtResize( 512 ),
-            et.ExtRandomCrop(size=(opts.crop_size, opts.crop_size)),
-            et.ExtColorJitter(brightness=0.5, contrast=0.5, saturation=0.5),
-            et.ExtRandomHorizontalFlip(),
-            et.ExtToTensor(),
-            et.ExtNormalize(mean=[0.485, 0.456, 0.406],
-                            std=[0.229, 0.224, 0.225]),
-        ])
-
-        val_transform = et.ExtCompose([
-            # et.ExtResize( 512 ),
-            et.ExtToTensor(),
-            et.ExtNormalize(mean=[0.485, 0.456, 0.406],
-                            std=[0.229, 0.224, 0.225]),
-        ])
-
-        train_dst = Cityscapes(root=opts.data_root,
-                               split='train', transform=train_transform)
-        val_dst = Cityscapes(root=opts.data_root,
-                             split='val', transform=val_transform)
-    return train_dst, val_dst
 
 
-def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
-    """Do validation and return specified samples"""
+def try_gpu(i=0):
+    """如果存在， 则返回GPU（i),否则返回CPU()."""
+    if torch.cuda.device_count() >= i+1:
+        return torch.device(f'cuda:{i}')
+    return torch.device('cpu')
+
+def try_all_gpus():
+    """返回所有可用的GPU，如果没有GPU，则返回[CPU(),]。"""
+    devices = [torch.device(f'cuda:{i}') for i in range(torch.cuda.device_count())]
+    return devices if devices else [torch.device('cpu')]
+
+def loss(inputs, targets):
+    #在损失计算中需指定通道维，然后mean(1)先宽再高
+    #这里在确定一下
+    return F.cross_entropy(inputs, targets, reduction='none').mean(1).mean(1)
+
+
+
+
+def validate(opts, model, loader, device, metrics, ret_samples_ids=None, test_dst):
+    """验证集可视化及保存
+    Do validation and return specified samples"""
     metrics.reset()
     ret_samples = []
     if opts.save_val_results:
         if not os.path.exists('results'):
             os.mkdir('results')
+        #反标准化
         denorm = utils.Denormalize(mean=[0.485, 0.456, 0.406],
                                    std=[0.229, 0.224, 0.225])
         img_id = 0
 
     with torch.no_grad():
+        #测试时不需要存梯度
         for i, (images, labels) in tqdm(enumerate(loader)):
 
             images = images.to(device, dtype=torch.float32)
             labels = labels.to(device, dtype=torch.long)
 
-            outputs = model(images)
+            X = test_dst.dataset.normalize_image(img).unsqueeze(0)
+            outputs = label2image(model(images), device=try_gpu())
             preds = outputs.detach().max(dim=1)[1].cpu().numpy()
             targets = labels.cpu().numpy()
 
             metrics.update(targets, preds)
+            #可视化例子
             if ret_samples_ids is not None and i in ret_samples_ids:  # get vis samples
                 ret_samples.append(
                     (images[0].detach().cpu().numpy(), targets[0], preds[0]))
 
+           #保存验证结果
             if opts.save_val_results:
                 for i in range(len(images)):
                     image = images[i].detach().cpu().numpy()
@@ -210,12 +181,8 @@ def validate(opts, model, loader, device, metrics, ret_samples_ids=None):
 
 def main():
     opts = get_argparser().parse_args()
-    if opts.dataset.lower() == 'voc':
-        opts.num_classes = 21
-    elif opts.dataset.lower() == 'cityscapes':
-        opts.num_classes = 19
 
-    # Setup visualization
+    #Setup visualization
     vis = Visualizer(port=opts.vis_port,
                      env=opts.vis_env) if opts.enable_vis else None
     if vis is not None:  # display options
@@ -223,6 +190,7 @@ def main():
 
     os.environ['CUDA_VISIBLE_DEVICES'] = opts.gpu_id
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    devices = try_all_gpus()
     print("Device: %s" % device)
 
     # Setup random seed
@@ -232,18 +200,14 @@ def main():
 
     # Setup dataloader
     if opts.dataset == 'voc' and not opts.crop_val:
-        opts.val_batch_size = 1
+        opts.val_batch_size = 128
 
-    train_dst, val_dst = get_dataset(opts)
-    train_loader = data.DataLoader(
-        train_dst, batch_size=opts.batch_size, shuffle=True, num_workers=2,
-        drop_last=True)  # drop_last=True to ignore single-image batches.
-    val_loader = data.DataLoader(
-        val_dst, batch_size=opts.val_batch_size, shuffle=True, num_workers=2)
+    train_dst, test_dst = load_data_voc(opts.batch_size, opts.val_batch_size, opts.crop_size)
     print("Dataset: %s, Train set: %d, Val set: %d" %
-          (opts.dataset, len(train_dst), len(val_dst)))
+          (opts.dataset, len(train_dst), len(test_dst)))
 
     # Set up model (all models are 'constructed at network.modeling)
+    ##output_stride 是什么
     model = network.modeling.__dict__[opts.model](num_classes=opts.num_classes, output_stride=opts.output_stride)
     if opts.separable_conv and 'plus' in opts.model:
         network.convert_to_separable_conv(model.classifier)
@@ -266,10 +230,10 @@ def main():
 
     # Set up criterion
     # criterion = utils.get_loss(opts.loss_type)
-    if opts.loss_type == 'focal_loss':
-        criterion = utils.FocalLoss(ignore_index=255, size_average=True)
-    elif opts.loss_type == 'cross_entropy':
-        criterion = nn.CrossEntropyLoss(ignore_index=255, reduction='mean')
+    # if opts.loss_type == 'focal_loss':
+    #     criterion = utils.FocalLoss(size_average=True)
+    # elif opts.loss_type == 'cross_entropy':
+    #       criterion = nn.CrossEntropyLoss(reduction='mean')
 
     def save_ckpt(path):
         """ save current model
@@ -288,6 +252,7 @@ def main():
     best_score = 0.0
     cur_itrs = 0
     cur_epochs = 0
+    #读取预训练模型判断某一对象是否是文件
     if opts.ckpt is not None and os.path.isfile(opts.ckpt):
         # https://github.com/VainF/DeepLabV3Plus-Pytorch/issues/8#issuecomment-605601402, @PytaichukBohdan
         checkpoint = torch.load(opts.ckpt, map_location=torch.device('cpu'))
@@ -308,23 +273,23 @@ def main():
         model.to(device)
 
     # ==========   Train Loop   ==========#
-    vis_sample_id = np.random.randint(0, len(val_loader), opts.vis_num_samples,
+    vis_sample_id = np.random.randint(0, len(test_dst), opts.vis_num_samples,
                                       np.int32) if opts.enable_vis else None  # sample idxs for visualization
     denorm = utils.Denormalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # denormalization for ori images
 
     if opts.test_only:
         model.eval()
         val_score, ret_samples = validate(
-            opts=opts, model=model, loader=val_loader, device=device, metrics=metrics, ret_samples_ids=vis_sample_id)
+            opts=opts, model=model, loader=test_dst, device=device, metrics=metrics, ret_samples_ids=vis_sample_id)
         print(metrics.to_str(val_score))
         return
 
     interval_loss = 0
     while True:  # cur_itrs < opts.total_itrs:
-        # =====  Train  =====
+        # 训练函数
         model.train()
         cur_epochs += 1
-        for (images, labels) in train_loader:
+        for (images, labels) in train_dst:
             cur_itrs += 1
 
             images = images.to(device, dtype=torch.float32)
@@ -332,19 +297,19 @@ def main():
 
             optimizer.zero_grad()
             outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
+            ls = loss(outputs, labels)
+            ls.sum().backward()
             optimizer.step()
 
-            np_loss = loss.detach().cpu().numpy()
+            np_loss = ls.detach().cpu().numpy()
             interval_loss += np_loss
             if vis is not None:
-                vis.vis_scalar('Loss', cur_itrs, np_loss)
+                vis.vis_scalar('Loss', cur_itrs, np.mean(np_loss))
 
             if (cur_itrs) % 10 == 0:
                 interval_loss = interval_loss / 10
                 print("Epoch %d, Itrs %d/%d, Loss=%f" %
-                      (cur_epochs, cur_itrs, opts.total_itrs, interval_loss))
+                      (cur_epochs, cur_itrs, opts.total_itrs, np.mean(interval_loss)))
                 interval_loss = 0.0
 
             if (cur_itrs) % opts.val_interval == 0:
@@ -353,7 +318,7 @@ def main():
                 print("validation...")
                 model.eval()
                 val_score, ret_samples = validate(
-                    opts=opts, model=model, loader=val_loader, device=device, metrics=metrics,
+                    opts=opts, model=model, loader=test_dst, device=device, metrics=metrics,
                     ret_samples_ids=vis_sample_id)
                 print(metrics.to_str(val_score))
                 if val_score['Mean IoU'] > best_score:  # save best model

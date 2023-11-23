@@ -2,9 +2,8 @@ from visdom import Visdom
 import json 
 
 class Visualizer(object):
-    """ Visualizer
-    """
-    def __init__(self, port='13579', env='main', id=None):
+    """ Visualizer"""
+    def __init__(self, port='18097', env='main', id=None):
         #self.cur_win = {}
         self.vis = Visdom(port=port, env=env)
         self.id = id
