@@ -2,6 +2,7 @@ from tqdm import tqdm
 import network
 import utils
 import os
+from d2l import torch as d2l
 import random
 import argparse
 import numpy as np
@@ -41,6 +42,8 @@ def get_argparser():
     parser.add_argument("--num_epochs", type=int, default=5, help="Epochs")
     parser.add_argument("--lr", type=float, default=0.01, help="learning rate (default: 0.01)")
     parser.add_argument("--step_size", type=int, default=10000)
+    parser.add_argument("--weight_decay", type=float, default=1e-4,
+                        help='weight decay (default: 1e-4)')
 
 
 
@@ -246,16 +249,15 @@ def main():
     print("Dataset: %s, Train set: %d, Val set: %d" % ("postdam", len(train_iter), len(test_iter)))
 
     # Setup random seed
-    torch.manual_seed(opts.random_seed)
-    np.random.seed(opts.random_seed)
-    random.seed(opts.random_seed)
+    # torch.manual_seed(opts.random_seed)
+    # np.random.seed(opts.random_seed)
+    # random.seed(opts.random_seed)
 
     # Set up model (all models are 'constructed at network.modeling)
     model = network.modeling.__dict__[opts.model](num_classes=opts.num_classes, output_stride=opts.output_stride)
     if opts.separable_conv and 'plus' in opts.model:
         network.convert_to_separable_conv(model.classifier)
     utils.set_bn_momentum(model.backbone, momentum=0.01)
-    model = nn.DataParallel(model)
     model.to(device)
 
     # Set up optimizer
