@@ -4,6 +4,7 @@ import numpy as np
 class _StreamMetrics(object):
     def __init__(self):
         """ Overridden by subclasses """
+        #表示尚未实现的某种方法
         raise NotImplementedError()
 
     def update(self, gt, pred):
@@ -28,11 +29,12 @@ class StreamSegMetrics(_StreamMetrics):
     """
     def __init__(self, n_classes):
         self.n_classes = n_classes
+        #混淆矩阵
         self.confusion_matrix = np.zeros((n_classes, n_classes))
 
     def update(self, label_trues, label_preds):
         for lt, lp in zip(label_trues, label_preds):
-            self.confusion_matrix += self._fast_hist( lt.flatten(), lp.flatten() )
+            self.confusion_matrix += self._fast_hist(lt.flatten(), lp.flatten())
     
     @staticmethod
     def to_str(results):
