@@ -127,19 +127,20 @@ def main():
         crop_rect = (0, 0, 250, 250)
         X = torchvision.transforms.functional.crop(test_images[i], *crop_rect)
         pred = label2image(predict(X))
-        # imgs += [X.permute(1, 2, 0), pred.cpu(),
-        #          torchvision.transforms.functional.crop(
-        #              test_labels[i], *crop_rect).permute(1, 2, 0)]
-        Ximg = np.uint8(np.array(X.detach()))
-        predimg = np.uint8(np.array(pred.cpu().permute(2,0,1)))
-        labimg = np.uint8(np.arraytorchvision.transforms.functional.crop(
-                     test_labels[i], *crop_rect))
+        Ximg = np.uint8(np.array(X.detach().permute(1,2,0)))
+        predimg = np.uint8(np.array(pred.cpu()))
+        labimg = np.uint8(np.array((torchvision.transforms.functional.crop(
+                     test_labels[i], *crop_rect).permute(1,2,0))))
         iXimg, ipredimg, ilabimg = Image.fromarray(Ximg), Image.fromarray(predimg), Image.fromarray(labimg)
         iXimg.save(r"samples/x_%d.jpg" % (i))
         ipredimg.save(r"samples/pred_%d.jpg" % (i))
         ilabimg.save(r"samples/lab_%d.jpg" % (i))
 
-    d2l.show_images(imgs[::3] + imgs[1::3] + imgs[2::3], 3, n, scale=2)
+
+
+
+
+
 
 
 

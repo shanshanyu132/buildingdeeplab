@@ -24,7 +24,7 @@ def read_postdam_images(voc_dir, is_train=True):
         a0 = a * 0
         a1 = np.array([a0, a0, a])
         tran1 = tran * a1
-        if (a.sum()>=256*256*0.1) & (a.sum()<=256*256*0.8):
+        if (a.sum()>=256*256*0.05) & (a.sum()<=256*256*0.95):
             features.append(torchvision.io.read_image(os.path.join(voc_dir, 'train' if is_train else 'test', 'img', f'{fname}')))
             labels.append(tran1)
     return features, labels

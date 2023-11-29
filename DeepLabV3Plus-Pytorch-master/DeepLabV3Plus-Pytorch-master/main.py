@@ -28,18 +28,17 @@ def get_argparser():
     # Deeplab Options
     available_models = sorted(name for name in network.modeling.__dict__ if name.islower() and \
                               not (name.startswith("__") or name.startswith('_')) and callable(
-        network.modeling.__dict__[name])
-                              )
+        network.modeling.__dict__[name]))
     parser.add_argument("--model", type=str, default='deeplabv3plus_mobilenet',
                         choices=available_models, help='model name')
     parser.add_argument("--separable_conv", action='store_true', default=False,
                         help="apply separable conv to decoder and aspp")
     #model index setting
     parser.add_argument("--output_stride", type=int, default=16, choices=[8, 16])
-    parser.add_argument("--batch_size", type=int, default=256, help="train batch size")
-    parser.add_argument("--val_batch_size", type=int, default=128, help="train batch size")
+    parser.add_argument("--batch_size", type=int, default=128, help="train batch size")
+    parser.add_argument("--val_batch_size", type=int, default=64, help="train batch size")
     parser.add_argument("--gpu_id", type=str, default='0', help="GPU ID")
-    parser.add_argument("--num_epochs", type=int, default=5, help="Epochs")
+    parser.add_argument("--num_epochs", type=int, default=100, help="Epochs")
     parser.add_argument("--lr", type=float, default=0.01, help="learning rate (default: 0.01)")
     parser.add_argument("--step_size", type=int, default=10000)
     parser.add_argument("--weight_decay", type=float, default=1e-4,
@@ -107,6 +106,19 @@ def get_argparser():
     return parser
 
 
+
+
+def try_gpu(i=0):
+    """如果存在， 则返回GPU（i),否则返回CPU()."""
+    if torch.cuda.device_count() >= i+1:
+        return torch.device(f'cuda:{i}')
+    return torch.device('cpu')
+
+def try_all_gpus():
+    """返回所有可用的GPU，如果没有GPU，则返回[CPU(),]。"""
+    devices = [torch.device(f'cuda:{i}') for i in range(torch.cuda.device_count())]
+    return devices if devices else [torch.device('cpu')]
+
 def loss(inputs, targets):
     #在损失计算中需指定通道维，然后mean(1)先宽再高
     #这里在确定一下
@@ -125,7 +137,7 @@ def train_batch_ch13(net, X, y, loss, trainer, devices, scheduler):
     trainer.step()
     scheduler.step()
     train_loss_sum = l.sum()
-    train_acc_sum = accuracy(pred, y)
+    train_acc_sum = d2l.accuracy(pred, y)
     return train_loss_sum, train_acc_sum
 
 def train_ch13(net, train_iter, test_iter, loss, trainer, num_epochs, devices=try_all_gpus()):
@@ -136,15 +148,17 @@ def train_ch13(net, train_iter, test_iter, loss, trainer, num_epochs, devices=tr
     net = nn.DataParallel(net, device_ids=devices).to(devices[0])
     for epoch in range(num_epochs):
         #四个维度：储存训练损失，训练准确度，实例数，特点数
-        metric = Accumulator(4)
+        metric = d2l.Accumulator(4)
         for i, (features, labels) in enumerate(train_iter):
             timer.start()
             l, acc = train_batch_ch13(net, features, labels, loss, trainer, devices, scheduler)
             metric.add(l, acc, labels.shape[0], labels.numel())
             timer.stop()
             if (i + 1) % (num_batches // 5) == 0 or i == num_batches - 1:
-                test_acc = evaluate_accuracy_gpu(net, test_iter)
+                test_acc = d2l.evaluate_accuracy_gpu(net, test_iter)
                 print("Epoch:%d, iter:%d, loss:%.3f, train_acc:%.3f, test_acc:%.3f" % (epoch, epoch+(i + 1)/num_batches, (metric[0] / metric[2]), (metric[1] / metric[3]), test_acc))
+                with open("metric.txt", 'a+') as f:
+                    f.write("Epoch:%d, iter:%d, loss:%.3f, train_acc:%.3f, test_acc:%.3f" % (epoch, epoch+(i + 1)/num_batches, (metric[0] / metric[2]), (metric[1] / metric[3]), test_acc) + '\n')
     print(f'loss {metric[0] / metric[2]:.3f}, train acc '
           f'{metric[1] / metric[3]:.3f}, test acc {test_acc:.3f}')
     print(f'{metric[2] * num_epochs / timer.sum():.1f} examples/sec on '
@@ -230,9 +244,14 @@ def main():
     device = try_gpu(i=0)
     os.environ['CUDA_VISIBLE_DEVICES'] = opts.gpu_id
 
-    crop_size = (150, 200)
+    crop_size = (250, 250)
     train_iter, test_iter = load_data_voc(opts.batch_size, opts.val_batch_size, crop_size)
     print("Dataset: %s, Train set: %d, Val set: %d" % ("postdam", len(train_iter), len(test_iter)))
+
+    # Setup random seed
+    # torch.manual_seed(opts.random_seed)
+    # np.random.seed(opts.random_seed)
+    # random.seed(opts.random_seed)
 
     # Set up model (all models are 'constructed at network.modeling)
     model = network.modeling.__dict__[opts.model](num_classes=opts.num_classes, output_stride=opts.output_stride)
@@ -251,10 +270,7 @@ def main():
     train_ch13(model, train_iter, test_iter, loss, optimizer, opts.num_epochs, devices)
     torch.save(model, "checkpoints/latest_1.pth")
 
-    # Setup random seed
-    # torch.manual_seed(opts.random_seed)
-    # np.random.seed(opts.random_seed)
-    # random.seed(opts.random_seed)
+
     # Set up metrics
     # metrics = StreamSegMetrics(opts.num_classes)
     # utils.mkdir('checkpoints')

@@ -1,5 +1,5 @@
-from visdom import Visdom
-import json 
+# from visdom import Visdom
+# import json
 
 # class Visualizer(object):
 #     """ Visualizer"""
